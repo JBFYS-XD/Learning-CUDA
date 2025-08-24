@@ -152,6 +152,62 @@ T kthLargest(const std::vector<T>& h_input, size_t k) {
  */
 
 template <typename T>
+__device__ T block_reduce_max(T* smem, T val) {
+  int tid = threadIdx.x;
+  int lane = tid % 32;
+  int warp_id = tid / 32;
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    T other = __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    val = fmaxf(val, other);
+  }
+
+  if (lane == 0)
+    smem[warp_id] = val;
+  __syncthreads();
+
+  if (warp_id == 0) {
+    val = lane >= 8 ? -1e9 : smem[lane];
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      T other = __shfl_xor_sync(0xFFFFFFFF, val, offset);
+      val = fmaxf(val, other);
+    }
+    smem[0] = val;
+  }
+  __syncthreads();
+
+  return smem[0];
+}
+
+template <typename T>
+__device__ T block_reduce_sum(T* smem, T val) {
+  int tid = threadIdx.x;
+  int lane = tid % 32;
+  int warp_id = tid / 32;
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    T other = __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    val = val + other;
+  }
+
+  if (lane == 0)
+    smem[warp_id] = val;
+  __syncthreads();
+
+  if (warp_id == 0) {
+    val = lane >= 8 ? 0 : smem[lane];
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      T other = __shfl_xor_sync(0xFFFFFFFF, val, offset);
+      val = val + other;
+    }
+    smem[0] = val;
+  }
+  __syncthreads();
+
+  return smem[0];
+}
+
+template <typename T>
 __global__ void flashAttentionKernel(
   const T* query, const T* key,
   const T* value, T* output,
@@ -168,8 +224,10 @@ __global__ void flashAttentionKernel(
   
   extern __shared__ uint8_t shared_mem[];
   T* scores = reinterpret_cast<T*>(shared_mem);
+  T* smem = scores + src_seq_len;
 
   for (int tgt = 0; tgt < target_seq_len; tgt ++) {
+    float mx = -1e9;
     for (int src = threadIdx.x; src < src_seq_len; src += blockDim.x) {
       if (is_causal && tgt < src) {
         scores[src] = -1e9f;
@@ -183,22 +241,24 @@ __global__ void flashAttentionKernel(
           sum += query[qid] * key[kid];
         }
         scores[src] = sum / sqrtf(float(head_dim));
+        mx = fmaxf(mx, scores[src]);
       }
     }
     __syncthreads();
 
-    if (threadIdx.x == 0) {
-      float mx = -1e9;
-      for (int i = 0; i < src_seq_len; i ++)
-        mx = fmaxf(mx, scores[i]);
-      float sum = 0.;
-      for (int i = 0; i < src_seq_len; i ++) {
-        scores[i] = expf(scores[i] - mx);
-        sum += scores[i];
-      }
-      float val = 1. / sum;
-      for (int i = 0; i < src_seq_len; i ++)
-        scores[i] *= val;
+    mx = block_reduce_max(smem, mx);
+    
+    T sum = 0.;
+    for (int src = threadIdx.x; src < src_seq_len; src += blockDim.x) {
+      scores[src] = expf(scores[src] - mx);
+      sum += scores[src];
+    }
+    __syncthreads();
+
+    sum = block_reduce_sum(smem, sum);
+
+    for (int src = threadIdx.x; src < src_seq_len; src += blockDim.x) {
+      scores[src] = scores[src] / (sum + 1e-8f);
     }
     __syncthreads();
 
@@ -245,7 +305,7 @@ void flashAttention(
 
   dim3 gridSize(batch_size, query_heads);
   int blockSize = 256;
-  size_t shared_mem = src_seq_len * sizeof(T);
+  size_t shared_mem = src_seq_len * sizeof(T) + 8 * sizeof(T);
   flashAttentionKernel<T><<<gridSize, blockSize, shared_mem>>>(
     d_q, d_k, d_v, d_o,
     batch_size, target_seq_len, src_seq_len, 
