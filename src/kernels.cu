@@ -18,119 +18,73 @@
  */
 
 template <typename T>
-__global__ void kTopSort1(T* input, int n) {
-  extern __shared__ uint8_t shared_mem[];  // 单一符号，无类型冲突
-  
-  int blockSize = blockDim.x;
-  // 手动划分：前 512 个 T 为 smem，后 512 个为 tmp
-  T* smem = reinterpret_cast<T*>(shared_mem);
-  T* tmp  = smem + (blockSize << 1);  // 指向后半部分
-  
-  int tid = threadIdx.x;
-  int idx = blockDim.x * blockIdx.x + threadIdx.x;
-  int posb = tid << 1, posg = idx << 1;
-  
-  smem[posb] = posg < n ? input[posg] : 1e9;
-  smem[posb | 1] = (posg | 1) < n ? input[posg | 1] : 1e9;
-  __syncthreads();
-  for (int flag = 1; flag <= blockSize; flag <<= 1) {
-    int start = posb;
-    int mid = min(start + flag, blockSize << 1);
-    int end = min(start + (flag << 1), blockSize << 1);
-    if ((tid % flag) == 0) {
-      int l = start, r = mid, k = start;
-      while (l < mid && r < end) {
-        if (smem[l] < smem[r])
-        tmp[k ++] = smem[l ++];
-        else
-        tmp[k ++] = smem[r ++];
-      }
-      
-      while (l < mid) tmp[k ++] = smem[l ++];
-      while (r < end) tmp[k ++] = smem[r ++];
-      
+__global__ void bitonic_sort_kernel(T* input, int n, int desc, int k, int j) {
+  int x = blockDim.x * blockIdx.x + threadIdx.x;
+  int y = x ^ j;
+  if (x >= n || x > y) return;
+  T valx = input[x];
+  T valy = input[y];
+  T val;
+  if ((valx > valy) == (desc ^ ((x & k) != 0))) {
+    if (x > y) {
+      input[x] = valy;
+      input[y] = valx;
+    } 
+  } else {
+    if (x < y) {
+      input[x] = valy;
+      input[y] = valx;  
     }
-    __syncthreads();
-    
-    smem[start] = tmp[start];
-    smem[start + 1] = tmp[start + 1];
-    __syncthreads();
   }
-  
-  if (posg < n) input[posg] = smem[posb];
-  if ((posg | 1) < n) input[posg | 1] = smem[posb | 1];
 }
 
 template <typename T>
-__global__ void kTopSort2(T* input, int n, T* gtmp, int flag) {
-  int tid = threadIdx.x;
-  int bid = blockIdx.x;
-
-  int start = bid * flag * 2;
-  int mid = min(start + flag, n);
-  int end = min(start + (flag << 1), n);
-
-  if (tid == 0) {
-    int l = start, r = mid, k = start;
-    while (l < mid && r < end) {
-      if (input[l] < input[r])
-        gtmp[k ++] = input[l ++];
-      else
-        gtmp[k ++] = input[r ++];
-    }
-  
-    while (l < mid) gtmp[k ++] = input[l ++];
-    while (r < end) gtmp[k ++] = input[r ++];
+__global__ void init_input(T* input, int n, int mx) {
+  int x = blockDim.x * blockIdx.x + threadIdx.x;
+  if (x < n && x >= mx) {
+    input[x] = T(-1e9);
   }
-
-  __syncthreads();
-  for (int i = start + tid; i < end; i += blockDim.x) {
-    if (i < n)
-      input[i] = gtmp[i];
-  }
-
-}
-
-template <typename T>
-void kTopSort_Work(T* input, T* gtmp, size_t n) {
-  int blockSize = 256;
-
-  int flag = 1;
-  int gridSize = ((n + flag - 1) / flag + blockSize - 1) / blockSize;
-  size_t shared_mem = blockSize * sizeof(T) * 4;
-  kTopSort1<T><<<gridSize, blockSize, shared_mem>>>(input, n);
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  for (flag = 512; flag < n; flag <<= 1) {
-    gridSize = (n + flag - 1) / flag;
-    kTopSort2<T><<<gridSize, blockSize>>>(input, n, gtmp, flag);
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 template <typename T>
 T kthLargest(const std::vector<T>& h_input, size_t k) {
   // TODO: Implement the kthLargest function
+  int n = h_input.size();
   
-  size_t n = h_input.size();
-  if (k < 1 || k > n) return T(-100);
+  if (k < 1 || k > n) 
+    return T(-100);
   
-  size_t size_T = sizeof(T);
-  size_t size_arr = n * size_T;
-  
+  while (__builtin_popcount(n) != 1) n += (n & (-n));
+
   T *d_input;
-  T* gtmp;
-  CUDA_CHECK(cudaMalloc(&d_input, size_arr));
-  CUDA_CHECK(cudaMalloc(&gtmp, n * sizeof(T)));
-  CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), size_arr, cudaMemcpyHostToDevice));
+
+  size_t size_input = h_input.size()  * sizeof(T);
+  size_t size_malloc = n * sizeof(T);
+
+  CUDA_CHECK(cudaMalloc(&d_input, size_malloc));
   
-  kTopSort_Work<T>(d_input, gtmp, n);
+  CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), size_input, cudaMemcpyHostToDevice));
+  
+  
+  int blockSize = 256;
+  int gridSize = (n + 255) / 256;
+  
+  init_input<T><<<gridSize, blockSize>>>(d_input, n, h_input.size());
+  CUDA_CHECK(cudaDeviceSynchronize());
+  
+
+  for (int k = 2; k <= n; k <<= 1) {
+    for (int j = (k >> 1); j > 0; j >>= 1) {
+      bitonic_sort_kernel<T><<<gridSize, blockSize>>>(d_input, n, 1, k, j);
+      CUDA_CHECK(cudaDeviceSynchronize());
+    }
+  }
   
   T result;
-  CUDA_CHECK(cudaMemcpy(&result, d_input + (n - k), size_T, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(&result, d_input + (k - 1), sizeof(T), cudaMemcpyDeviceToHost));
   
-  CUDA_CHECK(cudaFree(gtmp));
   CUDA_CHECK(cudaFree(d_input));
+  
   return result;
 }
 
